@@ -1,0 +1,103 @@
+# LiveScribe — builds an unsigned .ipa for AltStore/SideStore on GitHub's macOS runners.
+# Builds from the source files in this repository.
+name: Build LiveScribe IPA
+
+on:
+  push:
+    branches-ignore: [build-output]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Detect source mode
+        run: |
+          if [ -f project.yml ]; then
+            echo "Building from the source files in this repository."
+            echo "EMBED=0" >> "$GITHUB_ENV"
+          else
+            echo "Building from the source embedded in this workflow."
+            echo "EMBED=1" >> "$GITHUB_ENV"
+          fi
+
+
+      - name: Generate app icon
+        run: |
+          ICON="LiveScribe/Assets.xcassets/AppIcon.appiconset/icon.png"
+          if [ ! -f "$ICON" ]; then python3 tools/make_icon.py "$ICON"; fi
+          ls -l "$ICON"
+
+      - name: Install XcodeGen
+        run: command -v xcodegen >/dev/null || brew install xcodegen
+
+      - name: Generate Xcode project
+        run: |
+          set -o pipefail
+          xcodegen generate 2>&1 | tee -a build.log
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          xcodebuild -version | tee -a build.log
+          xcodebuild -project LiveScribe.xcodeproj -target LiveScribe \
+            -configuration Release -sdk iphoneos \
+            SYMROOT="$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            -quiet build 2>&1 | tee -a build.log
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="build/Release-iphoneos/LiveScribe.app"
+          APPEX="$APP/PlugIns/LiveScribeBroadcast.appex"
+          test -d "$APP" && test -d "$APPEX"
+          # Ad-hoc sign so the app-group entitlement is embedded; AltStore re-signs with your Apple ID.
+          codesign --force --sign - --entitlements Config/Broadcast.entitlements "$APPEX"
+          codesign --force --sign - --entitlements Config/LiveScribe.entitlements "$APP"
+          rm -rf Payload LiveScribe.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry LiveScribe.ipa Payload
+          ls -lh LiveScribe.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveScribe-ipa
+          path: LiveScribe.ipa
+
+      # The latest IPA (or the build log if it failed) is kept on the build-output branch.
+      # Public repo download link: https://github.com/<you>/<repo>/raw/build-output/LiveScribe.ipa
+      - name: Save result to build-output branch
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          GH_TOKEN_PUSH: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN: ${{ github.run_number }}
+        run: |
+          OUT="$RUNNER_TEMP/out"
+          rm -rf "$OUT" && mkdir -p "$OUT"
+          [ -f LiveScribe.ipa ] && cp LiveScribe.ipa "$OUT/"
+          [ -f build.log ] && tail -c 400000 build.log > "$OUT/build.log"
+          grep -E "error:|warning: .*(deprecated|unused)" build.log 2>/dev/null | head -200 > "$OUT/errors.txt" || true
+          printf '%s\n%s\n%s\n' "$JOB_STATUS" "$SHA" "$RUN" > "$OUT/status.txt"
+          cd "$OUT"
+          git init -q -b build-output
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -qm "Build $RUN ($JOB_STATUS) for $SHA"
+          git push -qf "https://x-access-token:$GH_TOKEN_PUSH@github.com/$REPO.git" build-output
